@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import requests
+from typing import Optional, Dict, Any
 
 app = FastAPI()
 
@@ -16,6 +17,10 @@ app.add_middleware(
 
 
 class TikTokRequest(BaseModel):
+    url: HttpUrl
+
+
+class ResolveRequest(BaseModel):
     url: HttpUrl
 
 
@@ -71,6 +76,86 @@ def tiktok_metadata(payload: TikTokRequest):
         "download_url": download_url,
         "duration": d.get("duration"),
         "author": d.get("author"),
+    }
+
+
+@app.post("/api/resolve")
+def resolve_generic(payload: ResolveRequest):
+    """
+    Resolve direct media for popular platforms (YouTube, Instagram, TikTok, RED/Rednote, etc.)
+    using yt-dlp without downloading. Returns a normalized response.
+    """
+    try:
+        import yt_dlp  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp not available: {e}")
+
+    ydl_opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bv*+ba/b[ext=mp4]/b/bestaudio/best",
+        "noplaylist": True,
+        "skip_download": True,
+        "cachedir": False,
+        "http_chunk_size": 10485760,  # 10MB chunks can help some CDNs
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(str(payload.url), download=False)
+    except yt_dlp.utils.DownloadError as e:  # type: ignore
+        raise HTTPException(status_code=400, detail=f"Failed to extract: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+    # If a playlist-like object, pick first entry
+    if info.get("_type") == "playlist" and info.get("entries"):
+        info = info["entries"][0]
+
+    title: str = info.get("title") or "Video"
+    cover: Optional[str] = info.get("thumbnail") or info.get("thumbnails", [{}])[0].get("url")
+    author: Optional[str] = info.get("uploader") or info.get("channel") or info.get("author")
+    duration: Optional[float] = info.get("duration")
+
+    # Determine a streaming URL from requested formats or formats
+    download_url: Optional[str] = None
+    # When format selection picks merged formats, yt-dlp exposes requested_formats
+    requested_formats = info.get("requested_formats") or []
+    if requested_formats:
+        # Prefer the video part if available else the first
+        for f in requested_formats:
+            if f.get("vcodec") != "none" and f.get("url"):
+                download_url = f.get("url")
+                break
+        if not download_url and requested_formats[0].get("url"):
+            download_url = requested_formats[0].get("url")
+
+    if not download_url:
+        # Fall back to the best single format url
+        if info.get("url"):
+            download_url = info.get("url")
+        else:
+            formats = info.get("formats") or []
+            # Choose best mp4 if possible otherwise last format
+            best = None
+            for f in formats:
+                if f.get("url") and (f.get("ext") == "mp4"):
+                    best = f
+            if not best and formats:
+                best = formats[-1]
+            if best:
+                download_url = best.get("url")
+
+    if not download_url:
+        raise HTTPException(status_code=404, detail="Could not determine a direct media URL")
+
+    return {
+        "title": title,
+        "cover": cover,
+        "download_url": download_url,
+        "duration": duration,
+        "author": author,
+        "source": info.get("extractor_key"),
     }
 
 
