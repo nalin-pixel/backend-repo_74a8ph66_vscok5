@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+import requests
 
 app = FastAPI()
 
@@ -12,13 +14,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class TikTokRequest(BaseModel):
+    url: HttpUrl
+
+
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI Backend!"}
 
+
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
+
+@app.post("/api/tiktok/metadata")
+def tiktok_metadata(payload: TikTokRequest):
+    """
+    Resolve TikTok video metadata and direct no-watermark download URL by calling a
+    reliable third-party resolver (tikwm.com). We simply proxy essential data.
+    """
+    try:
+        resp = requests.post(
+            "https://www.tikwm.com/api/",
+            data={"url": str(payload.url)},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                "Referer": "https://www.tikwm.com/",
+                "Origin": "https://www.tikwm.com",
+            },
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Resolver network error: {e}")
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Resolver error")
+
+    data = resp.json()
+    if not data or data.get("code") != 0 or not data.get("data"):
+        raise HTTPException(status_code=400, detail=data.get("msg", "Failed to resolve video"))
+
+    d = data["data"]
+    # Prefer hdplay (no watermark) if present, fall back to play.
+    download_url = d.get("hdplay") or d.get("play")
+    if not download_url:
+        raise HTTPException(status_code=404, detail="Download URL not found")
+
+    title = d.get("title") or "TikTok Video"
+    cover = d.get("cover") or d.get("origin_cover") or d.get("music_info", {}).get("cover")
+
+    return {
+        "title": title,
+        "cover": cover,
+        "download_url": download_url,
+        "duration": d.get("duration"),
+        "author": d.get("author"),
+    }
+
 
 @app.get("/test")
 def test_database():
